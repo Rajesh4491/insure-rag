@@ -1,0 +1,51 @@
+# Secrets — NEVER commit
+.env
+*.key
+*.pem
+*.p12
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Testing
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+
+# Models (large binaries — store in Azure Blob / DVC)
+models/*.ubj
+models/*.pt
+models/*.pkl
+models/*.joblib
+
+# MLflow
+mlruns/
+mlflow.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Docker
+.dockerignore
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Terraform state (use remote backend)
+infra/terraform/*.tfstate
+infra/terraform/*.tfstate.backup
+infra/terraform/.terraform/

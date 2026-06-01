@@ -1,0 +1,142 @@
+name: InsureRAG CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: insurerag.azurecr.io
+  IMAGE_NAME: insurerag-api
+  AKS_CLUSTER: insurerag-aks
+  AKS_RESOURCE_GROUP: insurerag-rg
+  NAMESPACE: insurerag
+
+jobs:
+
+  # ── Test ──────────────────────────────────────────────────────────────
+  test:
+    name: Test & lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Lint with ruff
+        run: |
+          pip install ruff
+          ruff check app/ tests/ scripts/
+
+      - name: Type check with mypy
+        run: |
+          pip install mypy
+          mypy app/ --ignore-missing-imports --no-strict-optional
+
+      - name: Run tests
+        env:
+          AZURE_OPENAI_ENDPOINT: "https://mock.openai.azure.com/"
+          AZURE_OPENAI_API_KEY: "test-key"
+          AZURE_SEARCH_ENDPOINT: "https://mock.search.windows.net"
+          AZURE_SEARCH_KEY: "test-key"
+        run: |
+          pytest tests/ -v --tb=short --cov=app --cov-report=xml
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+
+  # ── Build & push Docker image ──────────────────────────────────────────
+  build:
+    name: Build Docker image
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Azure Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=true
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: infra/docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+  # ── Deploy to AKS ────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to AKS
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set AKS context
+        uses: azure/aks-set-context@v3
+        with:
+          resource-group: ${{ env.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ env.AKS_CLUSTER }}
+
+      - name: Update image tag in manifests
+        run: |
+          SHA_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-$(git rev-parse --short HEAD)"
+          sed -i "s|insurerag.azurecr.io/insurerag-api:latest|${SHA_TAG}|g" infra/k8s/deployment.yaml
+
+      - name: Apply Kubernetes manifests
+        run: kubectl apply -f infra/k8s/deployment.yaml
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/insurerag-api \
+            -n ${{ env.NAMESPACE }} --timeout=300s
+
+      - name: Verify deployment health
+        run: |
+          ENDPOINT=$(kubectl get ingress insurerag-ingress \
+            -n ${{ env.NAMESPACE }} \
+            -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          echo "Deployed to: $ENDPOINT"
+          curl -f "https://insurerag.yourdomain.com/health" || echo "Health check via curl — verify manually"
+
+      - name: Notify on failure
+        if: failure()
+        run: echo "Deployment failed — check AKS rollout logs"

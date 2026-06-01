@@ -1,0 +1,260 @@
+---
+# Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: insurerag
+  labels:
+    app.kubernetes.io/name: insurerag
+
+---
+# ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: insurerag-config
+  namespace: insurerag
+data:
+  APP_ENV: "production"
+  LOG_LEVEL: "INFO"
+  AZURE_OPENAI_API_VERSION: "2024-08-01-preview"
+  AZURE_OPENAI_DEPLOYMENT_GPT4O: "gpt-4o-insurerag"
+  AZURE_OPENAI_DEPLOYMENT_EMBED: "text-embedding-3-large"
+  AZURE_SEARCH_INDEX_NAME: "insurerag-vectors"
+  AZURE_SEARCH_SEMANTIC_CONFIG: "insurerag-semantic"
+  VECTOR_SEARCH_TOP_K: "30"
+  HNSW_EF_SEARCH: "64"
+  CACHE_TTL_SECONDS: "300"
+  MLFLOW_EXPERIMENT_NAME: "insurerag-risk-scoring"
+  MLFLOW_REGISTRY_MODEL_NAME: "insurerag-ensemble"
+  KAFKA_CLAIMS_TOPIC: "claims-fnol"
+  KAFKA_CONSUMER_GROUP: "insurerag-ingest"
+  RISK_SCORE_CRITICAL_THRESHOLD: "80"
+  RISK_SCORE_HIGH_THRESHOLD: "65"
+  RISK_SCORE_MEDIUM_THRESHOLD: "45"
+
+---
+# Secret (values filled by CI/CD — never commit real secrets)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: insurerag-secrets
+  namespace: insurerag
+type: Opaque
+stringData:
+  AZURE_OPENAI_ENDPOINT: "REPLACE_WITH_AZURE_ENDPOINT"
+  AZURE_OPENAI_API_KEY: "REPLACE_WITH_KEY"
+  AZURE_SEARCH_ENDPOINT: "REPLACE_WITH_SEARCH_ENDPOINT"
+  AZURE_SEARCH_KEY: "REPLACE_WITH_SEARCH_KEY"
+  REDIS_URL: "redis://insurerag-redis:6379/0"
+  MLFLOW_TRACKING_URI: "http://mlflow-service:5000"
+  KAFKA_BOOTSTRAP_SERVERS: "kafka-service:9092"
+  API_KEYS: "REPLACE_WITH_API_KEYS"
+
+---
+# Deployment — API pods
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: insurerag-api
+  namespace: insurerag
+  labels:
+    app: insurerag-api
+    version: "1.0.0"
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: insurerag-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: insurerag-api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: insurerag-sa
+      containers:
+        - name: api
+          image: insurerag.azurecr.io/insurerag-api:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+              name: http
+          envFrom:
+            - configMapRef:
+                name: insurerag-config
+            - secretRef:
+                name: insurerag-secrets
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8000
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+          volumeMounts:
+            - name: models
+              mountPath: /app/models
+              readOnly: true
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: insurerag-models-pvc
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: insurerag-api
+
+---
+# Horizontal Pod Autoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: insurerag-api-hpa
+  namespace: insurerag
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: insurerag-api
+  minReplicas: 4
+  maxReplicas: 128
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+---
+# Service — internal ClusterIP
+apiVersion: v1
+kind: Service
+metadata:
+  name: insurerag-api-svc
+  namespace: insurerag
+spec:
+  selector:
+    app: insurerag-api
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8000
+  type: ClusterIP
+
+---
+# Ingress — Azure Application Gateway
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: insurerag-ingress
+  namespace: insurerag
+  annotations:
+    kubernetes.io/ingress.class: azure/application-gateway
+    appgw.ingress.kubernetes.io/ssl-redirect: "true"
+    appgw.ingress.kubernetes.io/request-timeout: "60"
+    appgw.ingress.kubernetes.io/connection-draining: "true"
+    appgw.ingress.kubernetes.io/connection-draining-timeout: "30"
+spec:
+  tls:
+    - hosts:
+        - insurerag.yourdomain.com
+      secretName: insurerag-tls
+  rules:
+    - host: insurerag.yourdomain.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: insurerag-api-svc
+                port:
+                  number: 80
+
+---
+# ServiceAccount with Azure Workload Identity
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: insurerag-sa
+  namespace: insurerag
+  annotations:
+    azure.workload.identity/client-id: "REPLACE_WITH_MANAGED_IDENTITY_CLIENT_ID"
+
+---
+# Redis StatefulSet
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: insurerag-redis
+  namespace: insurerag
+spec:
+  serviceName: insurerag-redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app: insurerag-redis
+  template:
+    metadata:
+      labels:
+        app: insurerag-redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          command: ["redis-server", "--maxmemory", "4gb", "--maxmemory-policy", "allkeys-lru"]
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "250m"
+            limits:
+              memory: "4Gi"
+              cpu: "1"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: insurerag-redis
+  namespace: insurerag
+spec:
+  selector:
+    app: insurerag-redis
+  ports:
+    - port: 6379
+      targetPort: 6379
